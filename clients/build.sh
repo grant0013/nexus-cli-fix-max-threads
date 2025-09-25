@@ -6,6 +6,24 @@ CLI_DIR="clients/cli"
 BIN_NAME="nexus-cli"   # change this to your binary name
 
 # --- Functions ---
+check_rust() {
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "⚠ Rust and Cargo are not installed."
+        read -rp "Do you want to install Rust via rustup? [Y/n] " install_rust
+        case $install_rust in
+            [Nn]* ) 
+                echo "Rust is required to build $BIN_NAME. Exiting."
+                exit 1
+                ;;
+            * )
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+                echo "✅ Rust installed. Please restart your terminal or run 'source \$HOME/.cargo/env'."
+                exit 0
+                ;;
+        esac
+    fi
+}
+
 build_cli() {
     echo "🚀 Building $BIN_NAME..."
     cd "$CLI_DIR"
@@ -45,10 +63,13 @@ for arg in "$@"; do
     esac
 done
 
-# Run build
+# Check Rust & Cargo
+check_rust
+
+# Build CLI
 build_cli
 
-# Decide install mode
+# Install if requested
 if $AUTO_INSTALL; then
     install_cli
 else
