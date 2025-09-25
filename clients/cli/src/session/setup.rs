@@ -97,9 +97,12 @@ pub async fn setup_session(
     if check_mem {
         warn_memory_configuration(max_threads);
     }
+    
+// Clamp the number of workers to available physical CPUs
+let num_workers: usize = max_threads
+    .map(|n| n as usize)                  // If user set --max-threads, honor it
+    .unwrap_or_else(|| num_cpus::get_physical()); // Otherwise, default to all physical cores
 
-    // Clamp the number of workers to [1,8]. Keep this low for now to avoid rate limiting.
-    let num_workers: usize = max_threads.unwrap_or(1) as usize;
 
     // Create shutdown channel - only one shutdown signal needed
     let (shutdown_sender, _) = broadcast::channel(1);
