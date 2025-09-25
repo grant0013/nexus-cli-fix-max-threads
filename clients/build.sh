@@ -3,7 +3,7 @@ set -euo pipefail
 
 # --- Config ---
 CLI_DIR="clients/cli"
-BIN_NAME="nexus-cli"   # change to match your binary name
+BIN_NAME="nexus-cli"   # change this to your binary name
 
 # --- Functions ---
 build_cli() {
@@ -21,10 +21,41 @@ install_cli() {
 }
 
 # --- Main ---
+AUTO_INSTALL=false
+
+# Parse arguments
+for arg in "$@"; do
+    case $arg in
+        --install|-i)
+            AUTO_INSTALL=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--install|-i]"
+            echo
+            echo "Options:"
+            echo "  --install, -i   Automatically install system-wide without asking"
+            echo "  --help, -h      Show this help message"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg"
+            exit 1
+            ;;
+    esac
+done
+
+# Run build
 build_cli
 
-read -rp "Do you want to install $BIN_NAME system-wide? [y/N] " yn
-case $yn in
-    [Yy]* ) install_cli ;;
-    * ) echo "Skipping installation. You can run it from $CLI_DIR/target/release/$BIN_NAME";;
-esac
+# Decide install mode
+if $AUTO_INSTALL; then
+    install_cli
+else
+    read -rp "Do you want to install $BIN_NAME system-wide? [y/N] " yn
+    case $yn in
+        [Yy]* ) install_cli ;;
+        * ) echo "Skipping installation. You can run it from $CLI_DIR/target/release/$BIN_NAME";;
+    esac
+fi
+echo "🎉 All done!"
