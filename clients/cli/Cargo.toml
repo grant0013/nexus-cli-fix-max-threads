@@ -16,24 +16,35 @@ path = "src/main.rs"
 opt-level = 1
 
 [profile.release]
-opt-level = 3          # Maximum optimization for best runtime performance
-lto = "fat"            # Full LTO for maximum optimization across crates
-codegen-units = 1      # Single codegen unit for maximum optimization
-panic = 'abort'        # Abort on panic (smaller binaries, better performance)
-strip = true           # Strip symbols for smaller binaries
-debug = false          # No debug symbols for faster builds
-incremental = false    # Disable incremental compilation for maximum optimization
+opt-level = 3              # Maximum optimization for best runtime performance
+lto = "fat"                # Full LTO across crates
+codegen-units = 1          # Best cross-crate inlining
+panic = "abort"            # Smaller + faster binaries
+strip = "symbols"          # Keep profiling compatibility while stripping
+debug = false
+incremental = false
+overflow-checks = false    # Disable integer overflow checks (faster math)
+
+[build]
+rustflags = [
+  "-C", "target-cpu=native",         # Use all CPU features
+  "-C", "target-feature=+aes,+sse2,+avx,+avx2,+fma,+bmi2", # SIMD + crypto accel
+  "-C", "inline-threshold=275",      # More aggressive inlining
+  "-C", "prefer-vector-width=256",   # Favor AVX2 vector width
+  "-C", "link-arg=-Wl,-O1",          # Optimize linker stage
+  "-C", "link-arg=-Wl,--as-needed"   # Drop unused deps at link time
+]
 
 [profile.ci-build]
 inherits = "dev"
-opt-level = 0              # No optimization for fastest compilation.
-debug = 0                  # No debug info for faster builds.
-debug-assertions = false   # Disable debug assertions to remove `debug!` macro prints.
-strip = "none"             # No stripping to save time.
-lto = false                # No LTO for faster compilation.
-codegen-units = 256        # Maximum parallel codegen units for faster compilation.
-incremental = true         # Enable incremental compilation for faster rebuilds.
-panic = "unwind"           # Use unwind for panics to allow tests to catch them.
+opt-level = 0
+debug = 0
+debug-assertions = false
+strip = "none"
+lto = false
+codegen-units = 256
+incremental = true
+panic = "unwind"
 
 [dependencies]
 async-trait = "0.1.88"
