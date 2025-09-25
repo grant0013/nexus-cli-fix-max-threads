@@ -3,7 +3,7 @@ set -euo pipefail
 
 # --- Config ---
 CLI_DIR="clients/cli"
-BIN_NAME="nexus-cli"   # change this to your binary name
+BIN_NAME="nexus-network"   # change this to your binary name
 
 # --- Functions ---
 check_rust() {
