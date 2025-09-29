@@ -8,9 +8,10 @@ use crate::orchestrator::OrchestratorClient;
 use crate::runtime::start_authenticated_worker;
 use ed25519_dalek::SigningKey;
 use std::error::Error;
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
+use std::time::Duration;
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 /// Session data for both TUI and headless modes
 #[derive(Debug)]
@@ -32,28 +33,29 @@ pub struct SessionData {
 }
 
 /// Warn the user if their available memory seems insufficient for the task(s) at hand
-pub fn warn_memory_configuration(max_threads: Option<u32>) {
+pub async fn warn_memory_configuration(max_threads: Option<u32>) {
     if let Some(threads) = max_threads {
-        let current_pid = Pid::from(std::process::id() as usize);
-
-        let mut sysinfo = System::new();
-        sysinfo.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[current_pid]),
-            true, // Refresh exact processes
-            ProcessRefreshKind::nothing().with_memory(),
+        // 1. Provide the refresh kind to `.with_memory()` as required by the new API.
+        let mut sys = System::new_with_specifics(
+            RefreshKind::default().with_memory(MemoryRefreshKind::everything()),
         );
 
-        if let Some(process) = sysinfo.process(current_pid) {
-            let ram_total = process.memory();
-            if threads as u64 * crate::consts::cli_consts::PROJECTED_MEMORY_REQUIREMENT >= ram_total
-            {
-                crate::print_cmd_warn!(
-                    "OOM warning",
-                    "Projected memory usage across {} requested threads exceeds memory currently available to process. In the event that proving fails due to an out-of-memory error, please restart the Nexus CLI with a smaller value supplied to `--max-threads`.",
-                    threads
-                );
-                std::thread::sleep(std::time::Duration::from_secs(3));
-            }
+        // 2. Now that the specifics are set, just call the simple `.refresh_memory()` method.
+        sys.refresh_memory();
+
+        let available_memory = sys.available_memory();
+        let projected_requirement =
+            threads as u64 * crate::consts::cli_consts::PROJECTED_MEMORY_REQUIREMENT;
+
+        if projected_requirement >= available_memory {
+            crate::print_cmd_warn!(
+                "OOM Warning",
+                "Projected memory usage for {} threads ({:.2} GB) may exceed available system memory ({:.2} GB). If proving fails, consider reducing --max-threads.",
+                threads,
+                projected_requirement as f64 / 1_073_741_824.0, // Bytes to GB
+                available_memory as f64 / 1_073_741_824.0      // Bytes to GB
+            );
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 }
@@ -83,7 +85,10 @@ pub async fn setup_session(
     max_tasks: Option<u32>,
     max_difficulty: Option<crate::nexus_orchestrator::TaskDifficulty>,
 ) -> Result<SessionData, Box<dyn Error>> {
-    let node_id = config.node_id.parse::<u64>()?;
+    // Add context to parsing errors for easier debugging.
+    let node_id = config.node_id.parse::<u64>().map_err(|e| {
+        format!("Failed to parse node_id '{}': {}", config.node_id, e)
+    })?;
     let client_id = config.user_id;
 
     // Create a signing key for the prover
@@ -95,14 +100,13 @@ pub async fn setup_session(
 
     // Warn the user if the memory demands of their configuration is risky
     if check_mem {
-        warn_memory_configuration(max_threads);
+        warn_memory_configuration(max_threads).await;
     }
-    
-// Clamp the number of workers to available physical CPUs
-let num_workers: usize = max_threads
-    .map(|n| n as usize)                  // If user set --max-threads, honor it
-    .unwrap_or_else(|| num_cpus::get_physical()); // Otherwise, default to all physical cores
 
+    // Clamp the number of workers to available physical CPUs
+    let num_workers: usize = max_threads
+        .map(|n| n as usize) // If user set --max-threads, honor it
+        .unwrap_or_else(|| num_cpus::get_physical()); // Otherwise, default to all physical cores
 
     // Create shutdown channel - only one shutdown signal needed
     let (shutdown_sender, _) = broadcast::channel(1);
