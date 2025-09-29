@@ -1,4 +1,4 @@
-//! Single authenticated worker that orchestrates fetch→prove→submit using a pipelined approach.
+//! Single authenticated worker that orchestrates fetch→prove→submit
 
 use super::core::{EventSender, WorkerConfig};
 use super::fetcher::TaskFetcher;
@@ -6,15 +6,13 @@ use super::prover::TaskProver;
 use super::submitter::ProofSubmitter;
 use crate::events::{Event, ProverState};
 use crate::orchestrator::OrchestratorClient;
-use crate::task::Task;
 
 use ed25519_dalek::SigningKey;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-/// Single authenticated worker that handles the complete task lifecycle.
-/// This implementation uses a pipelined approach to overlap network I/O with CPU-bound proving.
+/// Single authenticated worker that handles the complete task lifecycle
 pub struct AuthenticatedWorker {
     fetcher: TaskFetcher,
     prover: TaskProver,
@@ -45,7 +43,9 @@ impl AuthenticatedWorker {
             event_sender_helper.clone(),
             &config,
         );
+
         let prover = TaskProver::new(event_sender_helper.clone(), config.clone());
+
         let submitter = ProofSubmitter::new(
             signing_key,
             Box::new(orchestrator),
@@ -64,10 +64,11 @@ impl AuthenticatedWorker {
         }
     }
 
-    /// Start the worker's main event loop.
+    /// Start the worker
     pub async fn run(mut self, mut shutdown: broadcast::Receiver<()>) -> Vec<JoinHandle<()>> {
         let mut join_handles = Vec::new();
 
+        // Send initial state
         self.event_sender
             .send_event(Event::state_change(
                 ProverState::Waiting,
@@ -75,11 +76,19 @@ impl AuthenticatedWorker {
             ))
             .await;
 
-        // The main work loop is now self-contained within run_pipelined_cycle.
+        // Main work loop
         let worker_handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = shutdown.recv() => { /* Shutdown signal received, exit */ },
-                _ = self.run_pipelined_cycle() => { /* Work cycle completed or failed, exit */ },
+            loop {
+                tokio::select! {
+                    _ = shutdown.recv() => break,
+                    should_exit = self.work_cycle() => {
+                        if should_exit {
+                            break;
+                        }
+                        // Natural rate limiting through work cycle
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
             }
         });
         join_handles.push(worker_handle);
@@ -87,125 +96,101 @@ impl AuthenticatedWorker {
         join_handles
     }
 
-    /// Runs a continuous, pipelined work cycle.
-    /// It fetches the next task while proving the current one.
-    async fn run_pipelined_cycle(&mut self) {
-        // Step 1: "Prime the pump" by fetching the first task.
-        let mut current_task_to_prove = match self.fetcher.fetch_task().await {
+    /// Complete work cycle: fetch→prove→submit
+    /// Returns true if the worker should exit (max tasks reached)
+    async fn work_cycle(&mut self) -> bool {
+        // Step 1: Fetch task
+        let task = match self.fetcher.fetch_task().await {
             Ok(task) => task,
             Err(_) => {
-                // If we can't get the first task, wait and exit. The main loop will restart.
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                return;
+                // Error already logged in fetcher, wait before retry
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                return false; // Don't exit on fetch error, just retry
             }
         };
 
-        // The main pipeline loop
-        loop {
-            let start_time = Instant::now();
+        // Time starts from successfully obtaining the task
+        let start_time = std::time::Instant::now();
 
-            // Step 2: Concurrently prove the current task AND fetch the next one.
-            self.event_sender
-                .send_event(Event::state_change(
-                    ProverState::Proving,
-                    format!("Step 2 of 4: Proving task {}", current_task_to_prove.task_id),
-                ))
-                .await;
-
-            let (proof_result, next_task_result) = tokio::join!(
-                self.prover.prove_task(&current_task_to_prove),
-                self.fetcher.fetch_task()
-            );
-
-            // Step 3: Handle the results, starting with the proof.
-            let proof = match proof_result {
-                Ok(p) => p,
-                Err(_) => {
-                    self.event_sender
-                        .send_event(Event::state_change(
-                            ProverState::Waiting,
-                            "Proof generation failed, fetching next task".to_string(),
-                        ))
-                        .await;
-                    // Proving failed, but we may have a next task ready.
-                    // Discard the failed task and cycle with the next one.
-                    match next_task_result {
-                        Ok(next_task) => {
-                            current_task_to_prove = next_task;
-                            continue; // Go to next loop iteration
-                        }
-                        Err(_) => {
-                            // Both proving and fetching failed. Wait and exit.
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            return;
-                        }
-                    }
-                }
-            };
-
-            // Step 4: Submit the successful proof.
-            if self.submitter.submit_proof(&current_task_to_prove, &proof).await.is_ok() {
-                // On successful submission, update tracking and check for completion.
-                if self.handle_successful_submission(start_time, &current_task_to_prove).await {
-                    return; // Max tasks reached, exit loop.
-                }
-            }
-            // If submission fails, error is logged by submitter. Continue to next task.
-
-            // Step 5: Prepare for the next cycle.
-            match next_task_result {
-                Ok(next_task) => {
-                    current_task_to_prove = next_task;
-                }
-                Err(_) => {
-                    // Proving succeeded, but we couldn't get a next task.
-                    // Wait and exit; let the system restart the process.
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Handles logic for a successful submission to keep the main loop clean.
-    /// Returns true if the worker should shut down.
-    async fn handle_successful_submission(&mut self, start_time: Instant, task: &Task) -> bool {
-        self.tasks_completed += 1;
-        let duration_secs = start_time.elapsed().as_secs();
-        self.fetcher.update_success_tracking(duration_secs);
-
+        // Step 2: Prove task
+        // Send state change to Proving
         self.event_sender
             .send_event(Event::state_change(
-                ProverState::Waiting,
-                format!(
-                    "{} completed, Task size: {}, Duration: {}s, Difficulty: {}",
-                    task.task_id,
-                    task.public_inputs_list.len(),
-                    self.fetcher.last_success_duration_secs.unwrap_or(0),
-                    self.fetcher
-                        .last_success_difficulty
-                        .map(|d| d.as_str_name())
-                        .unwrap_or("Unknown")
-                ),
+                ProverState::Proving,
+                format!("Step 2 of 4: Proving task {}", task.task_id),
             ))
             .await;
 
-        if let Some(max) = self.max_tasks {
-            if self.tasks_completed >= max {
+        let proof_result = match self.prover.prove_task(&task).await {
+            Ok(proof_result) => proof_result,
+            Err(_) => {
+                // Send state change back to Waiting on proof failure
                 self.event_sender
                     .send_event(Event::state_change(
                         ProverState::Waiting,
-                        format!("Completed {} tasks, shutting down", self.tasks_completed),
+                        "Proof generation failed, ready for next task".to_string(),
                     ))
                     .await;
-                // Give a moment for the message to be processed before shutting down.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let _ = self.shutdown_sender.send(());
-                return true; // Signal to exit
+                return false; // Don't exit on proof error, just retry
+            }
+        };
+
+        // Step 3: Submit proof
+        let submission_result = self.submitter.submit_proof(&task, &proof_result).await;
+
+        // Only increment task counter on successful submission
+        if submission_result.is_ok() {
+            self.tasks_completed += 1;
+
+            // Update success tracking for difficulty promotion
+            let duration_secs = start_time.elapsed().as_secs();
+            self.fetcher.update_success_tracking(duration_secs);
+
+            // Send information about completing the task
+            self.event_sender
+                .send_event(Event::state_change(
+                    ProverState::Waiting,
+                    format!(
+                        "{} completed, Task size: {}, Duration: {}s, Difficulty: {}",
+                        task.task_id,
+                        task.public_inputs_list.len(),
+                        self.fetcher.last_success_duration_secs.unwrap_or(0),
+                        self.fetcher
+                            .last_success_difficulty
+                            .map(|difficulty| difficulty.as_str_name())
+                            .unwrap_or("Unknown")
+                    ),
+                ))
+                .await;
+            // Check if we've reached the maximum number of tasks
+            if let Some(max) = self.max_tasks {
+                if self.tasks_completed >= max {
+                    // Give a brief moment for the "Step 4 of 4" message to be processed
+                    // before triggering shutdown
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                    self.event_sender
+                        .send_event(Event::state_change(
+                            ProverState::Waiting,
+                            format!("Completed {} tasks, shutting down", self.tasks_completed),
+                        ))
+                        .await;
+
+                    // Send shutdown signal to trigger application exit
+                    let _ = self.shutdown_sender.send(());
+                    return true; // Signal to exit the worker loop
+                }
             }
         }
-        false // Do not exit
+
+        // Send state change back to Waiting at the end of the work cycle
+        self.event_sender
+            .send_event(Event::state_change(
+                ProverState::Waiting,
+                "Task completed, ready for next task".to_string(),
+            ))
+            .await;
+
+        false // Continue with more tasks
     }
 }
-
-
